@@ -1,0 +1,11 @@
+{
+  "name": "cyberracer-scheduler",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node notification_scheduler.js"
+  },
+  "dependencies": {
+    "firebase-admin": "^12.0.0",
+    "node-cron": "^3.0.3"
+  }
+}

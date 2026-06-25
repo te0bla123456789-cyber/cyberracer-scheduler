@@ -1,0 +1,433 @@
+// ═══════════════════════════════════════════════════════════════
+//  CYBERRACER — Scheduler de Notifications Push
+//  Fichier : notification_scheduler.js
+//
+//  RÔLE :
+//  Ce script tourne en continu (cron interne) et envoie des
+//  notifications push FCM selon le planning ci-dessous.
+//  Il utilise l'Admin SDK Firebase (accès total, bypass des rules)
+//  et l'API FCM v1 (OAuth 2.0, plus fiable que l'ancienne HTTP API).
+//
+//  CRÉNEAUX :
+//  ┌─────────────┬─────────────────────────────────────────────┐
+//  │ 07:45 lun-ven│ "Dans le bus" — bonus quotidien             │
+//  │ 17:00 lun-ven│ "Après les cours" — session de jeu          │
+//  │ 10:00 sam-dim│ "Week-end" — pièces doublées (si flag RTDB) │
+//  │ En continu  │ "Revanche" — quelqu'un bat un record         │
+//  └─────────────┴─────────────────────────────────────────────┘
+//
+//  PRÉREQUIS :
+//   1. Node.js ≥ 18
+//   2. npm install firebase-admin node-cron
+//   3. serviceAccount.json à côté de ce fichier
+//      (Firebase Console → Paramètres → Comptes de service → Clé privée)
+//   4. Activer Cloud Messaging API v1 dans Google Cloud Console :
+//      https://console.cloud.google.com/apis/library/fcm.googleapis.com
+//
+//  USAGE :
+//   node notification_scheduler.js          → démarre le scheduler
+//   node notification_scheduler.js --dry-run → simule sans envoyer
+//   node notification_scheduler.js --test-now BUS → envoie immédiatement le créneau BUS
+//   node notification_scheduler.js --test-now REVENGE --rival "NEONK1D" --loser-uid "abc123"
+//
+//  DÉPLOIEMENT RECOMMANDÉ :
+//   • Serveur Linux avec PM2 : pm2 start notification_scheduler.js --name cr-notifs
+//   • Ou Cloud Run Job / Render.com Free Tier / Railway.app
+// ═══════════════════════════════════════════════════════════════
+
+const admin  = require('firebase-admin');
+const cron   = require('node-cron');
+const path   = require('path');
+
+// ── Args CLI ─────────────────────────────────────────────────────
+const DRY_RUN    = process.argv.includes('--dry-run');
+const TEST_NOW   = process.argv.includes('--test-now')
+    ? process.argv[process.argv.indexOf('--test-now') + 1]
+    : null;
+const TEST_RIVAL   = process.argv.includes('--rival')
+    ? process.argv[process.argv.indexOf('--rival') + 1]
+    : 'UN RIVAL';
+const TEST_LOSER_UID = process.argv.includes('--loser-uid')
+    ? process.argv[process.argv.indexOf('--loser-uid') + 1]
+    : null;
+
+// ── Config ────────────────────────────────────────────────────────
+const SERVICE_ACCOUNT_PATH = path.join(__dirname, 'serviceAccount.json');
+const DATABASE_URL = 'https://cyberracer-bc9e5-default-rtdb.europe-west1.firebasedatabase.app';
+const PROJECT_ID   = 'cyberracer-bc9e5';
+
+// Mondes suivis pour l'alerte Revanche
+const WORLDS_TO_WATCH = ['cyberCity', 'solarCoast'];
+
+// Score précédent par monde (pour détecter les nouveaux records)
+// Map<world, Map<pseudo, score>>
+const _prevLeaderboard = new Map();
+
+// ── Init Firebase Admin ───────────────────────────────────────────
+admin.initializeApp({
+    credential:  admin.credential.cert(require(SERVICE_ACCOUNT_PATH)),
+    databaseURL: DATABASE_URL
+});
+
+const db = admin.database();
+
+// ════════════════════════════════════════════════════════════════
+//  HELPERS FCM — API v1 (via Admin SDK)
+// ════════════════════════════════════════════════════════════════
+
+/**
+ * Envoie une notification à un token FCM unique.
+ */
+async function sendToToken(token, { title, body, icon, tag, url, data = {} }) {
+    const message = {
+        token,
+        notification: { title, body },
+        webpush: {
+            notification: {
+                icon:  icon  || '/icon-192.png',
+                badge: '/badge-72.png',
+                tag:   tag   || 'cyberracer',
+                requireInteraction: false,
+                actions: [
+                    { action: 'play',  title: '🏎️ Jouer' },
+                    { action: 'later', title: '⏳ Plus tard' }
+                ]
+            },
+            fcmOptions: { link: url || '/' }
+        },
+        data: { url: url || '/', ...data }
+    };
+
+    if (DRY_RUN) {
+        console.log('[DRY-RUN] sendToToken :', token.substring(0,15) + '…', title, '|', body);
+        return;
+    }
+
+    try {
+        const res = await admin.messaging().send(message);
+        console.log(`[FCM] Envoyé → ${res}`);
+    } catch (err) {
+        if (err.code === 'messaging/registration-token-not-registered') {
+            // Token expiré → on le supprime de la RTDB
+            console.warn('[FCM] Token invalide — suppression du RTDB...');
+            await _removeStaleToken(token);
+        } else {
+            console.error('[FCM] Erreur envoi :', err.message);
+        }
+    }
+}
+
+/**
+ * Envoie une notification à TOUS les joueurs ayant un token FCM actif.
+ * Utilise sendEachForMulticast pour les batches jusqu'à 500 tokens.
+ */
+async function broadcastToAll({ title, body, icon, tag, url, data = {} }) {
+    const tokens = await _getAllTokens();
+    if (!tokens.length) {
+        console.log('[SCHEDULER] Aucun token FCM en base.');
+        return;
+    }
+
+    console.log(`[SCHEDULER] Broadcast → ${tokens.length} joueur(s) | "${title}"`);
+
+    // FCM multicast : max 500 tokens par appel
+    for (let i = 0; i < tokens.length; i += 500) {
+        const batch = tokens.slice(i, i + 500).map(t => t.token);
+
+        if (DRY_RUN) {
+            console.log(`[DRY-RUN] broadcast batch [${i}–${i+batch.length}] : "${title}" | "${body}"`);
+            continue;
+        }
+
+        const multicast = {
+            tokens: batch,
+            notification: { title, body },
+            webpush: {
+                notification: {
+                    icon:  icon  || '/icon-192.png',
+                    badge: '/badge-72.png',
+                    tag:   tag   || 'cyberracer',
+                    actions: [
+                        { action: 'play',  title: '🏎️ Jouer' },
+                        { action: 'later', title: '⏳ Plus tard' }
+                    ]
+                },
+                fcmOptions: { link: url || '/' }
+            },
+            data: { url: url || '/', ...data }
+        };
+
+        const result = await admin.messaging().sendEachForMulticast(multicast);
+        console.log(`[FCM] Batch [${i}] : ${result.successCount} OK, ${result.failureCount} KO`);
+
+        // Nettoie les tokens expirés
+        result.responses.forEach((r, idx) => {
+            if (!r.success && r.error &&
+                r.error.code === 'messaging/registration-token-not-registered') {
+                _removeStaleToken(batch[idx]).catch(() => {});
+            }
+        });
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  FIREBASE RTDB — lecture des tokens + leaderboard
+// ════════════════════════════════════════════════════════════════
+
+async function _getAllTokens() {
+    const snap = await db.ref('fcm_tokens').once('value');
+    if (!snap.exists()) return [];
+    const tokens = [];
+    snap.forEach(child => {
+        const v = child.val();
+        if (v && v.token) tokens.push({ uid: child.key, token: v.token, pseudo: v.pseudo || '' });
+    });
+    return tokens;
+}
+
+async function _getTokenByUid(uid) {
+    const snap = await db.ref(`fcm_tokens/${uid}`).once('value');
+    return snap.exists() ? snap.val().token : null;
+}
+
+async function _removeStaleToken(token) {
+    // Cherche dans fcm_tokens quel uid possède ce token
+    const snap = await db.ref('fcm_tokens').orderByChild('token').equalTo(token).once('value');
+    const promises = [];
+    snap.forEach(child => {
+        promises.push(db.ref(`fcm_tokens/${child.key}`).remove());
+        promises.push(db.ref(`players/${child.key}/fcmToken`).remove());
+        console.log(`[RTDB] Token supprimé pour uid=${child.key}`);
+    });
+    await Promise.all(promises);
+}
+
+async function _isDoubleCoinsWeekend() {
+    const snap = await db.ref('config/doubleCoinsWeekend').once('value');
+    return snap.val() === true;
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MESSAGES PAR CRÉNEAU
+//  Chaque fonction retourne un message aléatoire parmi sa liste.
+// ════════════════════════════════════════════════════════════════
+
+function _pick(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
+function _msgBus() {
+    return _pick([
+        {
+            title: '🚌 En route pour les cours ?',
+            body:  'Prends 10 secondes pour récupérer ton bonus quotidien avant d\'entrer en cours !'
+        },
+        {
+            title: '🏁 Dans les bouchons ?',
+            body:  'Viens faire ton meilleur sprint sur le jeu. Ton bonus t\'attend !'
+        },
+        {
+            title: '⏰ Bonne matinée, Pilote !',
+            body:  'Ton bonus quotidien est chaud. Claque-le vite avant le premier cours.'
+        }
+    ]);
+}
+
+function _msgAfterSchool() {
+    return _pick([
+        {
+            title: '🏎️ Fin de la journée !',
+            body:  'Ta voiture est chaude, viens tester tes réflexes sur le circuit du jour.'
+        },
+        {
+            title: '🛠️ Une journée de passée !',
+            body:  'Viens dépenser tes pièces dans le garage pour booster ton moteur.'
+        },
+        {
+            title: '⚡ Besoin de décompresser ?',
+            body:  'Enfile ton casque, la route Cyber City n\'attend que toi.'
+        },
+        {
+            title: '🎮 Session du soir ouverte !',
+            body:  'Le classement de la journée se joue maintenant. Tu es prêt ?'
+        }
+    ]);
+}
+
+function _msgWeekend(isDoubleCoins) {
+    if (isDoubleCoins) {
+        return {
+            title: '💥 Week-end BOOST activé !',
+            body:  'Les pièces sont DOUBLÉES sur toutes les pistes jusqu\'à dimanche soir. Fonce !'
+        };
+    }
+    return _pick([
+        {
+            title: '🏆 C\'est le week-end !',
+            body:  'Plus de temps, plus de runs. Le classement se joue maintenant.'
+        },
+        {
+            title: '🏁 Week-end sur la piste !',
+            body:  'Enchaîne les courses ce matin et monte dans le classement.'
+        }
+    ]);
+}
+
+function _msgRevenge(rivalPseudo) {
+    return _pick([
+        {
+            title: '💔 Alerte dérapage !',
+            body:  `${rivalPseudo} vient de briser ton record. Reprends ta place !`
+        },
+        {
+            title: '🏎️💨 On t\'a dépassé !',
+            body:  `${rivalPseudo} est devant toi dans le classement. Montre-leur qui est le boss.`
+        },
+        {
+            title: `⚔️ ${rivalPseudo} te défie !`,
+            body:  'Un nouveau meilleur temps vient d\'être posé. C\'est l\'heure de la revanche.'
+        }
+    ]);
+}
+
+// ════════════════════════════════════════════════════════════════
+//  JOBS PLANIFIÉS (cron)
+//  Format cron : seconde minute heure jour mois jourSemaine
+//  node-cron utilise le format : minute heure ... (sans secondes)
+// ════════════════════════════════════════════════════════════════
+
+console.log('🏎️  CyberRACER — Notification Scheduler démarré');
+console.log(`   Mode : ${DRY_RUN ? 'DRY-RUN' : 'PRODUCTION'}`);
+console.log('   Créneaux : 07h45 lun-ven | 17h00 lun-ven | 10h00 sam-dim + REVANCHE\n');
+
+// ── 07h45 du lundi au vendredi ────────────────────────────────────
+cron.schedule('45 7 * * 1-5', async () => {
+    console.log(`\n[CRON] 07h45 — "Dans le bus"`);
+    const msg = _msgBus();
+    await broadcastToAll({ ...msg, tag: 'cr-bus', url: '/' });
+}, { timezone: 'Europe/Paris' });
+
+// ── 17h00 du lundi au vendredi ────────────────────────────────────
+cron.schedule('0 17 * * 1-5', async () => {
+    console.log(`\n[CRON] 17h00 — "Après les cours"`);
+    const msg = _msgAfterSchool();
+    await broadcastToAll({ ...msg, tag: 'cr-afterschool', url: '/' });
+}, { timezone: 'Europe/Paris' });
+
+// ── 10h00 le samedi ET le dimanche ────────────────────────────────
+cron.schedule('0 10 * * 6,0', async () => {
+    console.log(`\n[CRON] 10h00 — "Week-end"`);
+    const isDouble = await _isDoubleCoinsWeekend();
+    const msg = _msgWeekend(isDouble);
+    await broadcastToAll({ ...msg, tag: 'cr-weekend', url: '/' });
+}, { timezone: 'Europe/Paris' });
+
+// ── REVANCHE — polling du leaderboard toutes les 2 minutes ────────
+cron.schedule('*/2 * * * *', async () => {
+    for (const world of WORLDS_TO_WATCH) {
+        await _checkRivalRecords(world);
+    }
+}, { timezone: 'Europe/Paris' });
+
+// ════════════════════════════════════════════════════════════════
+//  LOGIQUE "REVANCHE"
+//  Compare le leaderboard actuel avec la snapshot précédente.
+//  Si un joueur a amélioré son score et détrôné quelqu'un,
+//  on envoie une notif push à la victime.
+// ════════════════════════════════════════════════════════════════
+
+async function _checkRivalRecords(world) {
+    try {
+        const snap = await db.ref(`leaderboard/${world}`)
+            .orderByChild('score')
+            .limitToFirst(20)
+            .once('value');
+
+        if (!snap.exists()) return;
+
+        const current = new Map(); // uid → { pseudo, score }
+        snap.forEach(child => {
+            const v = child.val();
+            if (v && v.uid) current.set(v.uid, { pseudo: v.pseudo || 'Un rival', score: v.score || 0 });
+        });
+
+        const prev = _prevLeaderboard.get(world);
+
+        if (prev) {
+            // Cherche les joueurs qui ont amélioré leur score vs la snapshot précédente
+            for (const [uid, entry] of current) {
+                const prevEntry = prev.get(uid);
+                const isNewRecord = !prevEntry || entry.score > prevEntry.score;
+
+                if (isNewRecord) {
+                    // Ce joueur a amélioré son score : qui a-t-il dépassé ?
+                    // On notifie les joueurs qui étaient devant lui et sont maintenant derrière.
+                    for (const [victimUid, victimEntry] of prev) {
+                        if (victimUid === uid) continue;
+                        const victimCurrent = current.get(victimUid);
+
+                        // La victime était devant (score >) et est maintenant derrière
+                        if (victimCurrent && victimEntry.score >= (prevEntry ? prevEntry.score : 0)
+                            && entry.score > victimCurrent.score) {
+
+                            console.log(`[REVANCHE] ${entry.pseudo} a battu ${victimEntry.pseudo} sur ${world}`);
+
+                            const token = await _getTokenByUid(victimUid);
+                            if (!token) continue;
+
+                            const msg = _msgRevenge(entry.pseudo);
+                            await sendToToken(token, {
+                                ...msg,
+                                tag: `cr-revenge-${world}`,
+                                url: '/',
+                                data: { world, rivalPseudo: entry.pseudo }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Met à jour la snapshot
+        _prevLeaderboard.set(world, current);
+
+    } catch (err) {
+        console.error(`[REVANCHE] Erreur sur ${world} :`, err.message);
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  MODE --test-now  (debug immédiat sans attendre le cron)
+// ════════════════════════════════════════════════════════════════
+
+if (TEST_NOW) {
+    (async () => {
+        console.log(`\n[TEST] Envoi immédiat du créneau : ${TEST_NOW}\n`);
+        switch (TEST_NOW.toUpperCase()) {
+            case 'BUS':
+                await broadcastToAll({ ..._msgBus(), tag: 'cr-bus-test' });
+                break;
+            case 'AFTERSCHOOL':
+                await broadcastToAll({ ..._msgAfterSchool(), tag: 'cr-afterschool-test' });
+                break;
+            case 'WEEKEND':
+                await broadcastToAll({ ..._msgWeekend(true), tag: 'cr-weekend-test' });
+                break;
+            case 'REVENGE': {
+                const uid   = TEST_LOSER_UID;
+                const rival = TEST_RIVAL;
+                if (!uid) {
+                    console.error('[TEST] --loser-uid requis pour REVENGE. Ex: --loser-uid abc123uid');
+                    process.exit(1);
+                }
+                const token = await _getTokenByUid(uid);
+                if (!token) { console.error('[TEST] Aucun token trouvé pour cet uid.'); process.exit(1); }
+                await sendToToken(token, { ..._msgRevenge(rival), tag: 'cr-revenge-test' });
+                break;
+            }
+            default:
+                console.error(`[TEST] Créneau inconnu : ${TEST_NOW}. Valeurs : BUS | AFTERSCHOOL | WEEKEND | REVENGE`);
+                process.exit(1);
+        }
+        console.log('\n[TEST] Terminé.');
+        process.exit(0);
+    })();
+}

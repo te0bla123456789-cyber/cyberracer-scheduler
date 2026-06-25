@@ -52,7 +52,6 @@ const TEST_LOSER_UID = process.argv.includes('--loser-uid')
     : null;
 
 // ── Config ────────────────────────────────────────────────────────
-const SERVICE_ACCOUNT_PATH = path.join(__dirname, 'serviceAccount.json');
 const DATABASE_URL = 'https://cyberracer-bc9e5-default-rtdb.europe-west1.firebasedatabase.app';
 const PROJECT_ID   = 'cyberracer-bc9e5';
 
@@ -64,8 +63,13 @@ const WORLDS_TO_WATCH = ['cyberCity', 'solarCoast'];
 const _prevLeaderboard = new Map();
 
 // ── Init Firebase Admin ───────────────────────────────────────────
+// La clé est lue depuis la variable d'environnement Railway
+// (Variable : GOOGLE_APPLICATION_CREDENTIALS_JSON)
+// → jamais dans le code, jamais sur GitHub.
+const serviceAccount = JSON.parse(process.env.GOOGLE_APPLICATION_CREDENTIALS_JSON);
+
 admin.initializeApp({
-    credential:  admin.credential.cert(require(SERVICE_ACCOUNT_PATH)),
+    credential:  admin.credential.cert(serviceAccount),
     databaseURL: DATABASE_URL
 });
 
